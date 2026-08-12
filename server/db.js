@@ -811,6 +811,23 @@ try {
   db.prepare("ALTER TABLE agents ADD COLUMN awaiting_reason TEXT").run();
 }
 
+// Migrate: record the subagent id Claude Code itself stamps on hook payloads
+// (`agent_id`, e.g. "a33d677dca0393fed"). It is the join key that was missing
+// between the two ingestion paths: routes/hooks.js guessed the acting agent
+// heuristically, while scripts/import-history.js keyed the same subagent as
+// `<session>-jsonl-<agent_id>` off the transcript. The two never met, so every
+// imported subagent tool call landed a SECOND time next to the hook's copy
+// (15.6% of all tool events in a mature DB) and the hook copy was filed under
+// the main agent. Storing the id makes both paths resolve the same row.
+try {
+  db.prepare("SELECT claude_agent_id FROM agents LIMIT 1").get();
+} catch {
+  db.prepare("ALTER TABLE agents ADD COLUMN claude_agent_id TEXT").run();
+}
+db.prepare(
+  "CREATE INDEX IF NOT EXISTS idx_agents_claude_id ON agents(session_id, claude_agent_id)"
+).run();
+
 // Migrate: add `transcript_path` to sessions for fast active-session sweep.
 // Before this, the periodic compaction sweep had to do
 //   SELECT DISTINCT json_extract(events.data, '$.transcript_path') ...
@@ -1015,6 +1032,7 @@ try {
         awaiting_reason TEXT,
         workflow_run_id TEXT,
         workflow_phase TEXT,
+        claude_agent_id TEXT,
         FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
         FOREIGN KEY (parent_agent_id) REFERENCES agents(id) ON DELETE SET NULL
       );
@@ -1026,7 +1044,8 @@ try {
           ELSE status
         END,
         task, current_tool, started_at, ended_at, parent_agent_id, metadata,
-        updated_at, awaiting_input_since, awaiting_reason, workflow_run_id, workflow_phase
+        updated_at, awaiting_input_since, awaiting_reason, workflow_run_id, workflow_phase,
+        claude_agent_id
       FROM agents;
       DROP TABLE agents;
       ALTER TABLE agents_new RENAME TO agents;
@@ -1039,6 +1058,7 @@ try {
       CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
       CREATE INDEX IF NOT EXISTS idx_agents_parent ON agents(parent_agent_id);
       CREATE INDEX IF NOT EXISTS idx_agents_workflow ON agents(workflow_run_id);
+      CREATE INDEX IF NOT EXISTS idx_agents_claude_id ON agents(session_id, claude_agent_id);
     `);
   }
 }
@@ -1508,6 +1528,38 @@ const stmts = {
     ORDER BY ad.depth DESC, a.started_at DESC
     LIMIT 1
   `),
+
+  // --- Subagent identity carried by the hook payload (`agent_id`) -----------
+  // Claude Code stamps subagent hook events (PreToolUse / PostToolUse /
+  // SubagentStop) with the subagent's own id. It is authoritative, so it
+  // replaces the heuristics above wherever it is present — and it is the same
+  // id scripts/import-history.js derives from the subagent transcript, which
+  // is what stops the importer from inserting a duplicate of every hook event.
+  getAgentByClaudeId: db.prepare(
+    "SELECT * FROM agents WHERE session_id = ? AND claude_agent_id = ? LIMIT 1"
+  ),
+  // Guarded by `claude_agent_id IS NULL` so a binding is never stolen from an
+  // agent that already owns one.
+  bindAgentClaudeId: db.prepare(
+    "UPDATE agents SET claude_agent_id = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND claude_agent_id IS NULL"
+  ),
+  // A live subagent row created by the PreToolUse "Agent" hook has no
+  // claude_agent_id yet — the spawn event carries the SPAWNER's id, not the
+  // child's. The child's first own event is what binds the two. Matching on
+  // subagent_type when the payload provides one keeps concurrent subagents of
+  // different types apart; a NULL agent_type (which ~90% of SubagentStop
+  // payloads carry) falls back to the most recent unbound row. The type
+  // argument is bound twice — plain `?` placeholders, as everywhere else here.
+  findUnboundWorkingSubagent: db.prepare(
+    `SELECT * FROM agents
+     WHERE session_id = ?
+       AND type = 'subagent'
+       AND status = 'working'
+       AND claude_agent_id IS NULL
+       AND (? IS NULL OR subagent_type = ? OR subagent_type IS NULL)
+     ORDER BY started_at DESC
+     LIMIT 1`
+  ),
 
   touchSession: db.prepare(
     "UPDATE sessions SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?"
