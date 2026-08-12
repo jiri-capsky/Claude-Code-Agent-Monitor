@@ -187,6 +187,73 @@ function getMainAgent(sessionId) {
 }
 
 /**
+ * Resolve the agent a hook event belongs to from the subagent id Claude Code
+ * stamps on the payload (`agent_id`, e.g. "a33d677dca0393fed"), binding or
+ * creating the row when this is the first event we see from that subagent.
+ *
+ * Why this outranks the heuristics further down: the id is authoritative
+ * (nothing is inferred from "who looks busy right now"), it survives ingestion
+ * lag — a start-time heuristic with a 30s tolerance does not — and it is the
+ * SAME id scripts/import-history.js reads out of the subagent's own transcript.
+ * Filing hook events under `<session>-jsonl-<agent_id>`, the importer's own id
+ * scheme, is what lets its idempotency probe (agent_id, event_type,
+ * tool_use_id) recognise them instead of inserting a second copy of every
+ * subagent tool call — the source of ~16% duplicate tool events.
+ *
+ * Only subagent-context events carry the field (PreToolUse / PostToolUse /
+ * SubagentStop); main-agent events never do, so this returns null for them and
+ * the caller keeps attributing to the main agent.
+ *
+ * @returns {object|null} the resolved agent row, or null when the payload
+ *   carries no subagent id (or the row could not be created).
+ */
+function resolveClaudeAgent(sessionId, data, mainAgentId) {
+  const claudeId = typeof data.agent_id === "string" ? data.agent_id.trim() : "";
+  if (!claudeId) return null;
+
+  const bound = stmts.getAgentByClaudeId.get(sessionId, claudeId);
+  if (bound) return bound;
+
+  const agentType = typeof data.agent_type === "string" && data.agent_type ? data.agent_type : null;
+  const jsonlId = `${sessionId}-jsonl-${claudeId}`;
+
+  // The importer may already own a row for this subagent (earlier import, or a
+  // resumed session) — adopt it instead of creating a second one.
+  const imported = stmts.getAgent.get(jsonlId);
+  if (imported) {
+    stmts.bindAgentClaudeId.run(claudeId, jsonlId);
+    return stmts.getAgent.get(jsonlId);
+  }
+
+  // Otherwise adopt the live row the PreToolUse "Agent" hook created at spawn.
+  // That event carries the SPAWNER's id, not the child's, so the row starts
+  // unbound and the child's first own event is what ties them together.
+  const live = stmts.findUnboundWorkingSubagent.get(sessionId, agentType, agentType);
+  if (live) {
+    stmts.bindAgentClaudeId.run(claudeId, live.id);
+    return stmts.getAgent.get(live.id);
+  }
+
+  // Nothing to adopt — subagent spawned before this server started, or its
+  // spawn hook was dropped. Create the row under the importer's id scheme.
+  stmts.insertAgent.run(
+    jsonlId,
+    sessionId,
+    agentType || "Subagent",
+    "subagent",
+    agentType,
+    "working",
+    null,
+    mainAgentId,
+    null
+  );
+  stmts.bindAgentClaudeId.run(claudeId, jsonlId);
+  const created = stmts.getAgent.get(jsonlId);
+  if (created) broadcast("agent_created", created);
+  return created;
+}
+
+/**
  * True when `name` is an auto-generated / placeholder label rather than a
  * meaningful title the user picked. Covers:
  *   - empty / null
@@ -386,6 +453,13 @@ const processEvent = db.transaction((hookType, data) => {
   let summary = null;
   let agentId = mainAgentId;
 
+  // Authoritative subagent identity from the payload, when Claude Code sends
+  // it. Resolved once here and consulted by the per-case blocks below, which
+  // fall back to their heuristics only when it is absent. See
+  // resolveClaudeAgent() for why this is preferred over inference.
+  const claudeAgent = resolveClaudeAgent(sessionId, data, mainAgentId);
+  if (claudeAgent) agentId = claudeAgent.id;
+
   // NOTE: clearing of awaiting_input_since is handled per-case below rather
   // than blanket-clearing on every non-Notification event. The blanket rule
   // caused spontaneous waiting → active flips when *any* hook arrived after
@@ -431,8 +505,10 @@ const processEvent = db.transaction((hookType, data) => {
         //     the spawn must come from an already-running subagent — pick the deepest
         //     working subagent (most recently nested active agent).
         //   - Fallback to main if nothing else matches.
-        let parentId = mainAgentId;
-        if (mainAgent && mainAgent.status !== "working") {
+        // The spawn event carries the SPAWNER's agent_id, so when the payload
+        // identified it we know the parent outright instead of inferring it.
+        let parentId = claudeAgent ? claudeAgent.id : mainAgentId;
+        if (!claudeAgent && mainAgent && mainAgent.status !== "working") {
           const deepest = stmts.findDeepestWorkingAgent.get(sessionId, sessionId);
           if (deepest) {
             parentId = deepest.id;
@@ -466,8 +542,8 @@ const processEvent = db.transaction((hookType, data) => {
         mainAgent && mainAgent.status === "waiting"
           ? stmts.findDeepestWorkingAgent.get(sessionId, sessionId)
           : null;
-      const subagentIsActor = !!deepestWorking;
-      if (subagentIsActor && toolName !== "Agent") {
+      const subagentIsActor = !!deepestWorking || !!claudeAgent;
+      if (deepestWorking && !claudeAgent && toolName !== "Agent") {
         agentId = deepestWorking.id;
       }
       if (
@@ -503,7 +579,8 @@ const processEvent = db.transaction((hookType, data) => {
       // Subagent completion is handled by SubagentStop, not here.
 
       // Attribute to the working subagent when main is waiting (same heuristic as PreToolUse).
-      if (mainAgent && mainAgent.status === "waiting" && toolName !== "Agent") {
+      // Skipped when the payload already named the acting subagent.
+      if (!claudeAgent && mainAgent && mainAgent.status === "waiting" && toolName !== "Agent") {
         const deepest = stmts.findDeepestWorkingAgent.get(sessionId, sessionId);
         if (deepest) {
           agentId = deepest.id;
@@ -511,8 +588,9 @@ const processEvent = db.transaction((hookType, data) => {
       }
 
       // Only clear current_tool on the main agent if it's actively working.
-      // Skip if waiting (waiting for subagents) or already completed.
-      if (mainAgent && mainAgent.status === "working") {
+      // Skip if waiting (waiting for subagents) or already completed. A
+      // subagent's PostToolUse says nothing about what main is doing.
+      if (!claudeAgent && mainAgent && mainAgent.status === "working") {
         stmts.updateAgent.run(null, null, null, null, null, null, mainAgentId);
         broadcast("agent_updated", stmts.getAgent.get(mainAgentId));
       }
@@ -571,13 +649,16 @@ const processEvent = db.transaction((hookType, data) => {
     case "SubagentStop": {
       summary = `Subagent completed`;
       const subagents = stmts.listAgentsBySession.all(sessionId);
-      let matchingSub = null;
+      // The payload names the subagent that stopped (every SubagentStop event
+      // observed carries agent_id), so the name/type/prompt guesses below are
+      // only for payloads that lack it.
+      let matchingSub = claudeAgent && claudeAgent.type === "subagent" ? claudeAgent : null;
 
       // Try to identify which subagent stopped using available data.
       // SubagentStop provides: agent_type (e.g. "Explore", "test-engineer"),
       // agent_id (Claude's internal ID), description, last_assistant_message.
       const subDesc = data.description || data.agent_type || data.subagent_type || null;
-      if (subDesc) {
+      if (!matchingSub && subDesc) {
         const namePrefix = subDesc.length > 57 ? subDesc.slice(0, 57) : subDesc;
         matchingSub = subagents.find(
           (a) => a.type === "subagent" && a.status === "working" && a.name.startsWith(namePrefix)
